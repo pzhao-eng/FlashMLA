@@ -1,5 +1,7 @@
 # FlashMLA
 
+***Adapted from：*** https://github.com/deepseek-ai/FlashMLA/
+
 FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for variable-length sequences serving.
 
 Currently released:
@@ -20,7 +22,7 @@ python setup.py install
 python tests/test_flash_mla.py
 ```
 
-Achieving up to 3000 GB/s in memory-bound configuration and 580 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.6.
+Achieving up to 300 GB/s in and 125 TFLOPS on A100 SXM5, using CUDA 12.8.
 
 ### Usage
 
@@ -52,7 +54,7 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ```bibtex
 @misc{flashmla2025,
-      title={FlashMLA: Efficient MLA decoding kernel}, 
+      title={FlashMLA: Efficient MLA decoding kernel},
       author={Jiashi Li},
       year={2025},
       publisher = {GitHub},
