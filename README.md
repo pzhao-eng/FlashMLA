@@ -22,7 +22,7 @@ python setup.py install
 python tests/test_flash_mla.py
 ```
 
-Achieving up to 300 GB/s in and 125 TFLOPS on A100 SXM5, using CUDA 12.8.
+Achieving up to 360 GB/s in and 146 TFLOPS on A100, using CUDA 12.8.
 
 ### Usage
 
@@ -42,7 +42,7 @@ for i in range(num_layers):
 
 ## Requirements
 
-- Hopper GPUs
+- Ampere GPUs
 - CUDA 12.3 and above
 - PyTorch 2.0 and above
 

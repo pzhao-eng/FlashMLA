@@ -70,14 +70,15 @@ struct Flash_fwd_kernel_traits_mla {
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
+    using kP = Int<2>; // pipeline count
     using SmemLayoutK = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+            Shape<Int<kBlockN>, Int<kHeadDim>, kP>{}));
 
     using SmemLayoutV = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
-    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+            Shape<Int<kBlockN>, Int<kHeadDimV>, kP>{}));
+    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>, kP>{}, Stride<Int<kBlockN>,_1, Int<kHeadDim * kBlockN>>{})));
 
     using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreads>, _1, Int<kBlockN / 8>>>;
     using SmemLayoutRow = Layout<Shape<_2, Int<kNThreads>>, Stride<_1, _2>>;
@@ -284,12 +285,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     Tensor tQsQ = gmem_thr_copy.partition_D(sQ);
     Tensor tKgK = gmem_thr_copy.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K)
     Tensor tKsK = gmem_thr_copy.partition_D(sK);
+    auto K_PIPE_MAX = size<3>(tKsK); // pipeline count
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
-    Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
-    Tensor tOrVt = thr_mma.partition_fragment_B(sVt);                          // (MMA,MMA_M,MMA_N)
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK(_, _, 0));                  // (MMA,MMA_N,MMA_K)
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVt(_, _, 0));                 // (MMA,MMA_M,MMA_N)
 
     //
     // Copy Atom retiling
@@ -326,10 +328,15 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     flash::copy</*Is_even_MN*/false, /*Is_even_K*/true>(gmem_tiled_copy, tQgQ, tQsQ, tQcQ, tQpQ,
                                         params.seqlen_q - m_block * kBlockM);
 
+    // Current pipe index in smem to read from
+    int smem_pipe_read  = 0;
+    // Current pipe index in smem to write to
+    int smem_pipe_write = K_PIPE_MAX-1;
     // We need to clear the sK smem tiles because K is V.
     const index_t offset_k = cur_block_table * params.k_batch_stride;
     tKgK.data() = tKgK.data() + offset_k;
-    flash::copy</*Is_even_MN*/false, /*Is_even_K*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy, tKgK, tKsK, tKVcKV, tKVpKV,
+    Tensor tKsK_p = tKsK(_,_,_,0);
+    flash::copy</*Is_even_MN*/false, /*Is_even_K*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy, tKgK, tKsK_p, tKVcKV, tKVpKV,
                                        seqlen_k - n_block * kBlockN);
     tKgK.data() = tKgK.data() + -offset_k;
     cute::cp_async_fence();
@@ -352,10 +359,24 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
-        flash::cp_async_wait<0>();
+        if (n_block - 1 >= n_block_min) {
+            // Advance gK
+            const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
+            cur_block_table = __ldg(&block_table[n_block - 1]);
+            const index_t offset_k = cur_block_table * params.k_batch_stride;
+            tKgK.data() = tKgK.data() + offset_k;
+            Tensor tKsK_p = tKsK(_,_,_,smem_pipe_write);
+            flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK_p, tKVcKV, tKVpKV);
+            tKgK.data() = tKgK.data() + -offset_k;
+        }
+        // This cp_async_fence needs to be in the if block, otherwise the synchronization
+        // isn't right and we get race conditions.
+        cute::cp_async_fence();
+        flash::cp_async_wait<1>();
         __syncthreads();
 
-        flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+        Tensor tSsK_p = tSsK(_,_,_,smem_pipe_read);
+        flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K);
         // if (cute::thread0()) { print(acc_s); print("\n");}
 
@@ -391,23 +412,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         Tensor rP = flash::convert_type<Element>(acc_s);
         flash::rescale_o(acc_o, scale_o);
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (thread0()) {print(rank<0>(rP.layout())); print("\n");}
-        __syncthreads();
 
-        // TODO OPT using double buffer
-        if (n_block - 1 >= n_block_min) {
-            // Advance gK
-            const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
-            int cur_block_table = __ldg(&block_table[n_block - 1]);
-            const index_t offset_k = cur_block_table * params.k_batch_stride;
-            tKgK.data() = tKgK.data() + offset_k;
-            flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK, tKVcKV, tKVpKV);
-            tKgK.data() = tKgK.data() + -offset_k;
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
-        }
+        // Advance the smem pipe
+        smem_pipe_write = smem_pipe_read;
+        ++smem_pipe_read;
+        smem_pipe_read = smem_pipe_read % K_PIPE_MAX;
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -420,11 +432,23 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
-        flash::cp_async_wait<0>();
+        if (n_block - 1 >= n_block_min) {
+            // Advance gK
+            const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
+            cur_block_table = __ldg(&block_table[n_block - 1]);
+            const index_t offset_k = cur_block_table * params.k_batch_stride;
+            tKgK.data() = tKgK.data() + offset_k;
+            Tensor tKsK_p = tKsK(_,_,_,smem_pipe_write);
+            flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK_p, tKVcKV, tKVpKV);
+            tKgK.data() = tKgK.data() + -offset_k;
+        }
+        cute::cp_async_fence();
+        flash::cp_async_wait<1>();
         __syncthreads();
 
+        Tensor tSsK_p = tSsK(_,_,_,smem_pipe_read);
         flash::gemm_8x<false, false>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s, tSrQ, tSrK, tSsQ, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
 
@@ -433,22 +457,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
         flash::rescale_o(acc_o, scale_o);
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-        __syncthreads();
-
-        // TODO OPT
-        // gV and gK are same need double buffer
-        if (n_block - 1 >= n_block_min) {
-            // Advance gK
-            cur_block_table = __ldg(&block_table[n_block - 1]);
-            const index_t offset_k = cur_block_table * params.k_batch_stride;
-            tKgK.data() = tKgK.data() + offset_k;
-            flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK, tKVcKV, tKVpKV);
-            tKgK.data() = tKgK.data() + -offset_k;
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
-        }
+        Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        smem_pipe_write = smem_pipe_read;
+        ++smem_pipe_read;
+        smem_pipe_read = smem_pipe_read % K_PIPE_MAX;
     }
 
     // Epilogue
