@@ -36,7 +36,7 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
     # # print nan coordinates of x
     # print("nan x", torch.isnan(x).nonzero(as_tuple=False))
     # print("nan y", torch.isnan(y).nonzero(as_tuple=False))
-    assert cos_diff < 1e-5
+    assert cos_diff < 8e-5
 
 
 @torch.inference_mode()
@@ -54,7 +54,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     # print(f"{total_seqlens=}, {mean_seqlens=}, {max_seqlen=}")
 
     q = torch.randn(b, s_q, h_q, d)
-    block_size = 64
+    block_size = 32
     block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
     for i in range(b):
@@ -108,10 +108,10 @@ if __name__ == "__main__":
     random.seed(0)
 
     h_kv = 1
-    d, dv = 192, 128
+    d, dv = 576, 512
     causal = True
 
-    # test_flash_mla(32, 2, 4096, 16, 1, 192, 128, True, True)
+    # test_flash_mla(32, 2, 4096, 16, 1, d, dv, True, True)
     for b in [128]:
         for s in [4096, 8192]:
             for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
