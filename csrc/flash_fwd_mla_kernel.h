@@ -48,6 +48,8 @@ struct Flash_fwd_kernel_traits_mla {
     static_assert(kHeadDimV <= kHeadDim);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    static constexpr int kNumInnerStagesK = 3;
+    static constexpr int kNumInnerStagesV = 4;
 
     using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
     using TiledMma = TiledMMA<
@@ -69,11 +71,16 @@ struct Flash_fwd_kernel_traits_mla {
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+    using SmemLayoutSplitQ = decltype(composition(
+        SmemLayoutQ{},
+        make_layout(Shape<Int<kBlockM>, Int<kHeadDim / kNumInnerStagesK>, Int<kNumInnerStagesK>>{})));
 
     using kP = Int<2>; // pipeline count
     using SmemLayoutK = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDim>, kP>{}));
+    using SmemLayoutSplitK = decltype(composition(
+        SmemLayoutK{}, make_layout(Shape<Int<kBlockN>, Int<kHeadDim/kNumInnerStagesK>, Int<kNumInnerStagesK>, kP>{})));
 
     using SmemLayoutV = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
@@ -243,6 +250,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    constexpr int kNumInnerStagesK = Kernel_traits::kNumInnerStagesK;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -274,7 +282,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                             make_stride(params.k_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), typename Kernel_traits::SmemLayoutQ{});
+    Tensor sQ_split = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), typename Kernel_traits::SmemLayoutSplitQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutK{});
+    Tensor sK_split = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutSplitK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
     Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutVtransposed{});
 
@@ -289,8 +299,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
-    Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
-    Tensor tSrK  = thr_mma.partition_fragment_B(sK(_, _, 0));                  // (MMA,MMA_N,MMA_K)
+    Tensor tSrQ  = thr_mma.partition_fragment_A(sQ_split(_, _, 0));            // (MMA,MMA_M,MMA_K)
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK_split(_, _, 0, 0));         // (MMA,MMA_N,MMA_K)
     Tensor tOrVt = thr_mma.partition_fragment_B(sVt(_, _, 0));                 // (MMA,MMA_M,MMA_N)
 
     //
@@ -299,11 +309,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
-    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ_split);
 
     auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
-    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK_split);
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
@@ -375,9 +385,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         flash::cp_async_wait<1>();
         __syncthreads();
 
-        Tensor tSsK_p = tSsK(_,_,_,smem_pipe_read);
-        flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K);
+        #pragma unroll 1
+        for (int slice = 0; slice < kNumInnerStagesK; ++slice) {
+            Tensor tSsQ_p = tSsQ(_,_,_,slice);
+            Tensor tSsK_p = tSsK(_,_,_,slice, smem_pipe_read);
+            flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ_p, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
+        }
         // if (cute::thread0()) { print(acc_s); print("\n");}
 
         const bool is_masking_step = masking_step >= 0;
@@ -446,11 +460,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         flash::cp_async_wait<1>();
         __syncthreads();
 
-        Tensor tSsK_p = tSsK(_,_,_,smem_pipe_read);
-        flash::gemm_8x<false, false>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
+        #pragma unroll 1
+        for (int slice = 0; slice < kNumInnerStagesK; ++slice) {
+            Tensor tSsQ_p = tSsQ(_,_,_,slice);
+            Tensor tSsK_p = tSsK(_,_,_,slice, smem_pipe_read);
+            flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ_p, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
+        }
 
         Tensor scale_o = softmax.template softmax</*Is_first=*/false, /*Check_inf=*/false>(acc_s, params.scale_softmax_log2);
         Tensor rP = flash::convert_type<Element>(acc_s);
