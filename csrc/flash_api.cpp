@@ -1,4 +1,7 @@
 // Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ ******************************************************************************/
 
 #include <torch/python.h>
 #include <torch/nn/functional.h>
@@ -9,8 +12,6 @@
 
 #include "flash_mla.h"
 #include "static_switch.h"
-
-#define TORCH_EXTENSION_NAME flash_mla_cuda
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -24,7 +25,7 @@ get_mla_metadata(
 ) {
     // This should match the logic in the MLA kernel.
     static constexpr int block_size_m = 64;
-    static constexpr int block_size_n = 64;
+    static int block_size_n = at::cuda::getCurrentDeviceProperties()->major >= 9 ? 64 : 32;
     static constexpr int fixed_overhead_num_blocks = 5;
 
     CHECK_DEVICE(seqlens_k);
@@ -63,7 +64,7 @@ std::vector<at::Tensor>
 mha_fwd_kvcache_mla(
     at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size
-    c10::optional<const at::Tensor> &vcache_,    // num_blocks x page_block_size x num_heads_k x head_size_v
+    std::optional<const at::Tensor> &vcache_,    // num_blocks x page_block_size x num_heads_k x head_size_v
     const int head_size_v,
     const at::Tensor &seqlens_k,                 // batch_size
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
@@ -74,12 +75,12 @@ mha_fwd_kvcache_mla(
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-    TORCH_CHECK(is_sm8x);
+    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm8x, "Only sm80 to sm90 (inclusive) are supported");
 
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kBFloat16);
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
@@ -187,8 +188,28 @@ mha_fwd_kvcache_mla(
     params.oaccum_ptr = out_accum.data_ptr();
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(head_size == 192);
-    run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 192>(params, stream);
+
+    TORCH_CHECK(head_size == 576);
+
+    if (q_dtype == torch::kBFloat16) {
+        if (is_sm90) {
+            mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, true>::run(params, stream);
+        } else {
+            mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, false>::run(params, stream);
+        }
+    }
+    #ifndef FLASH_MLA_DISABLE_FP16
+    else if (q_dtype == torch::kHalf) {
+        if (is_sm90) {
+            mha_fwd_splitkv_mla<cutlass::half_t, 576, true>::run(params, stream);
+        } else {
+            TORCH_CHECK(false, "sm80 only support bfloat16");
+        }
+    }
+    #endif
+    else {
+        TORCH_CHECK(false, "Unsupported tensor dtype for query");
+    }
 
     out = out.view({batch_size, seqlen_q_ori, ngroups, num_heads_k, head_size_v}).transpose(2, 3)
             .reshape({batch_size, seqlen_q_ori, num_heads_ori, head_size_v});
