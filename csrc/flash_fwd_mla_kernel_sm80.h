@@ -50,6 +50,9 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
     static constexpr int kNumInnerStagesK = 3;
     static constexpr int kNumInnerStagesV = 4;
+    static_assert(kHeadDim_ % kNumInnerStagesK == 0, "kHeadDim must be a multiple of kNumInnerStagesK");
+    static_assert(kHeadDimV_ % kNumInnerStagesV == 0, "kHeadDim must be a multiple of kNumInnerStagesV");
+    static constexpr int kHeadDimVSplit = kHeadDimV / kNumInnerStagesV;
 
     using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
     using TiledMma = TiledMMA<
@@ -86,6 +89,11 @@ struct Flash_fwd_kernel_traits_mla {
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDimV>, kP>{}));
     using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>, kP>{}, Stride<Int<kBlockN>,_1, Int<kHeadDim * kBlockN>>{})));
+    using SmemLayoutVSplit = decltype(composition(
+        SmemLayoutV{}, make_layout(Shape<Int<kBlockN>, Int<kHeadDimVSplit>, Int<kNumInnerStagesV>, kP>{})));
+    using SmemLayoutVtransposedSplit = decltype(composition(
+        SmemLayoutV{}, make_layout(Shape<Int<kHeadDimVSplit>, Int<kBlockN>, Int<kNumInnerStagesV>, kP>{}, 
+            Stride<Int<kBlockN>,_1, Int<kHeadDimVSplit * kBlockN>, Int<kHeadDimV * kBlockN>>{})));
 
     using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreads>, _1, Int<kBlockN / 8>>>;
     using SmemLayoutRow = Layout<Shape<_2, Int<kNThreads>>, Stride<_1, _2>>;
@@ -251,6 +259,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     using index_t = typename Kernel_traits::index_t;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNumInnerStagesK = Kernel_traits::kNumInnerStagesK;
+    constexpr int kNumInnerStagesV = Kernel_traits::kNumInnerStagesV;
+    constexpr int kHeadDimVSplit = Kernel_traits::kHeadDimVSplit;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -287,6 +297,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     Tensor sK_split = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutSplitK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
     Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVt_split = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutVtransposedSplit{});
 
     typename Kernel_traits::GmemTiledCopy gmem_tiled_copy;
     auto gmem_thr_copy = gmem_tiled_copy.get_thread_slice(tidx);
@@ -301,7 +312,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ_split(_, _, 0));            // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK_split(_, _, 0, 0));         // (MMA,MMA_N,MMA_K)
-    Tensor tOrVt = thr_mma.partition_fragment_B(sVt(_, _, 0));                 // (MMA,MMA_M,MMA_N)
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVt_split(_, _, 0, 0));                 // (MMA,MMA_M,MMA_N)
 
     //
     // Copy Atom retiling
@@ -317,7 +328,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt_split);
     // PREDICATES
     //
     // Construct identity layout for sQ and sK
@@ -351,7 +362,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     tKgK.data() = tKgK.data() + -offset_k;
     cute::cp_async_fence();
 
-    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDimV>>{});  // MMA, MMA_M, MMA_K
+    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDimVSplit>, Int<kNumInnerStagesV>>{});  // MMA, MMA_M, MMA_K
+    auto acc_o_shape = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDimV>>{}).layout();  // MMA, MMA_M, MMA_K
     clear(acc_o);
 
     flash::Softmax<2 * size<1>(acc_o)> softmax;
@@ -424,10 +436,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
-        flash::rescale_o(acc_o, scale_o);
+        flash::rescale_o_reshape(acc_o, scale_o, acc_o_shape);
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        # pragma unroll 1
+        for (int slice_v = 0; slice_v < kNumInnerStagesV; ++slice_v) {
+            Tensor tOsVt_p = tOsVt(_,_,_,slice_v, smem_pipe_read);
+            Tensor acc_o_slice = acc_o(_, _, _, slice_v);
+            flash::gemm_rs(acc_o_slice, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
         // if (thread0()) {print(rank<0>(rP.layout())); print("\n");}
 
         // Advance the smem pipe
@@ -471,20 +487,24 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         Tensor scale_o = softmax.template softmax</*Is_first=*/false, /*Check_inf=*/false>(acc_s, params.scale_softmax_log2);
         Tensor rP = flash::convert_type<Element>(acc_s);
 
-        flash::rescale_o(acc_o, scale_o);
+        flash::rescale_o_reshape(acc_o, scale_o, acc_o_shape);
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        for (int slice_v = 0; slice_v < kNumInnerStagesV; ++slice_v) {
+            Tensor tOsVt_p = tOsVt(_,_,_,slice_v, smem_pipe_read);
+            Tensor acc_o_slice = acc_o(_, _, _, slice_v);
+            flash::gemm_rs(acc_o_slice, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
         smem_pipe_write = smem_pipe_read;
         ++smem_pipe_read;
         smem_pipe_read = smem_pipe_read % K_PIPE_MAX;
     }
 
     // Epilogue
+    Tensor acc_o_reshape = make_tensor(acc_o.data(), acc_o_shape);
     if(!Split) {
-        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax);
+        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o_reshape, softmax);
     } else {
-        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax);
+        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o_reshape, softmax);
     }
 }
 
