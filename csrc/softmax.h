@@ -129,16 +129,6 @@ __forceinline__ __device__ void rescale_o(Tensor0 &acc_o, Tensor1 &scale_o) {
         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale_o(mi); }
     }
 }
-template<typename Tensor0, typename Tensor1, typename Shape0>
-__forceinline__ __device__ void rescale_o_reshape(Tensor0 &acc_o, Tensor1 &scale_o, Shape0 &acc_o_shape) {
-    // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-    Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o_shape));
-    #pragma unroll
-    for (int mi = 0; mi < size(scale_o); ++mi) {
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale_o(mi); }
-    }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
