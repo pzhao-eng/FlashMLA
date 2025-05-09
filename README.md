@@ -2,11 +2,11 @@
 
 ***Adapted from：*** https://github.com/deepseek-ai/FlashMLA/
 
-FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for variable-length sequences serving.
+FlashMLA was initially developed based on Hopper(can refer to:https://github.com/deepseek-ai/FlashMLA/), and I adapted it to Amphere GPUs. Due to the different architectures, the performance of Amphere is currently poor due to register overflow. Welcome to add good optimization ideas.
 
 Currently released:
 - BF16
-- Paged kvcache with block size of 64
+- Paged kvcache with block size of 32
 
 ## Quick start
 
@@ -19,10 +19,15 @@ python setup.py install
 ### Benchmark
 
 ```bash
-python tests/test_flash_mla.py
+# amphere gpus
+python tests/test_flash_mla_sm80.py
+
+# hopper gpus
+python tests/test_flash_mla_sm90.py
 ```
 
-Achieving up to 360 GB/s in and 146 TFLOPS on A100, using CUDA 12.8.
+It is able up to 464 GB/s in memory-bound configuration and 59 TFLOPS in computation-bound configuration on A100 SXM, using CUDA 12.8.
+For [reference](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf), the peak bandwidth and fp16 FLOPS of A100 SXM are 2039 GB/s and 312 TFLOPS respectively. More efforts are needed to optimize the performance.
 
 ### Usage
 
