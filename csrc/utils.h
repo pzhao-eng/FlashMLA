@@ -1,4 +1,7 @@
 // Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/utils.h
+/******************************************************************************
+ * Copyright (c) 2024, Tri Dao.
+ ******************************************************************************/
 
 #pragma once
 

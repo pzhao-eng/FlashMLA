@@ -13,11 +13,11 @@ all :
 	@$(CMAKE_CMD) $(DEBUG_FLAGS) && make -s -j$(NUM_JOBS)
 
 run :
-	@cd build && cp ../tests/test_flash_mla.py . && cp -r ../flash_mla .  && python ./test_flash_mla.py
+	@cd build && cp ../tests/test_flash_mla_sm80.py . && cp -r ../flash_mla .  && python ./test_flash_mla.py
 
 
 clean:
-	read -r -p "This will delete the contents of build/*. Are you sure? [CRAL-C to abort] " response && rm -rf build/*
+	read -r -p "This will delete the contents of build/*. Are you sure? [CTRL-C to abort] " response && rm -rf build/*
 
 
 .PHONY: all clean
