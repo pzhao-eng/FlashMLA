@@ -2,7 +2,7 @@
 
 ***Adapted from：*** https://github.com/deepseek-ai/FlashMLA/
 
-FlashMLA was initially developed based on Hopper(can refer to:https://github.com/deepseek-ai/FlashMLA/), and I adapted it to Amphere GPUs. Due to the different architectures, the performance of Amphere is currently poor due to register overflow. Welcome to add good optimization ideas.
+FlashMLA was initially developed based on Hopper(can refer to:https://github.com/deepseek-ai/FlashMLA/), and I adapted it to Ampere GPUs. Due to the different architectures, the performance of Ampere is currently poor due to register overflow. Welcome to add good optimization ideas.
 
 Currently released:
 - BF16
