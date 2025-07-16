@@ -111,7 +111,7 @@ if __name__ == "__main__":
     d, dv = 576, 512
     causal = True
 
-    # test_flash_mla(32, 2, 4096, 16, 1, d, dv, True, True)
+    # test_flash_mla(1, 1, 4096, 16, 1, d, dv, True, True)
     for b in [128]:
         for s in [4096, 8192]:
             for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1

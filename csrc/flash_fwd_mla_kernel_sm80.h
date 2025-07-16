@@ -240,11 +240,11 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     );
 }
 
-template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
+template<typename Kernel_traits, bool Is_causal, bool Split, typename SharedStorage>
 __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_fwd_mla_params &params,
                                                                    const int bidb, const int bidh, const int m_block,
                                                                    const int n_split_idx, const int seqlen_k,
-                                                                   const int n_block_min, const int n_block_max, const bool Split,
+                                                                   const int n_block_min, const int n_block_max,
                                                                    SharedStorage &shared_storage) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -518,7 +518,11 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         if (batch_id > begin_idx) {
             __syncthreads();  // Barrier between two tiles.
         }
-        flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, !NoSplit, shared_storage);
+        if (!NoSplit) {
+            flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal, true>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, shared_storage);
+        } else {
+            flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal, false>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, shared_storage);
+        }
     }
 }
 
