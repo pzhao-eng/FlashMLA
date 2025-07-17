@@ -24,7 +24,7 @@ get_mla_metadata(
     const int num_heads_k
 ) {
     // This should match the logic in the MLA kernel.
-    static constexpr int block_size_m = 64;
+    static constexpr int block_size_m = 32;
     static int block_size_n = at::cuda::getCurrentDeviceProperties()->major >= 9 ? 64 : 32;
     static constexpr int fixed_overhead_num_blocks = 5;
 

@@ -646,7 +646,7 @@ struct mha_fwd_splitkv_mla<T, Headdim, false> {
         static_assert(Headdim == 576);
         FLASH_ASSERT(params.d_v == 512);
         FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 32, 4, T, 512>;
+        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 32, 32, 4, T, 512>;
         run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
     }
 };
