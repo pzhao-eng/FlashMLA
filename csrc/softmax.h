@@ -122,6 +122,55 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Cross-warp reduction helpers for multi-N-warp softmax
+
+template<int kNWarpsN, typename Engine0, typename Layout0>
+__forceinline__ __device__ void cross_warp_reduce_max(
+    Tensor<Engine0, Layout0> &val, float *smem_reduce,
+    int n_warp_idx, const int *row_indices, int stride)
+{
+    #pragma unroll
+    for (int mi = 0; mi < size(val); ++mi) {
+        smem_reduce[row_indices[mi] * stride + n_warp_idx] = val(mi);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int mi = 0; mi < size(val); ++mi) {
+        float result = smem_reduce[row_indices[mi] * stride];
+        #pragma unroll
+        for (int w = 1; w < kNWarpsN; ++w) {
+            result = max(result, smem_reduce[row_indices[mi] * stride + w]);
+        }
+        val(mi) = result;
+    }
+    __syncthreads();
+}
+
+template<int kNWarpsN, typename Engine0, typename Layout0>
+__forceinline__ __device__ void cross_warp_reduce_sum(
+    Tensor<Engine0, Layout0> &val, float *smem_reduce,
+    int n_warp_idx, const int *row_indices, int stride)
+{
+    #pragma unroll
+    for (int mi = 0; mi < size(val); ++mi) {
+        smem_reduce[row_indices[mi] * stride + n_warp_idx] = val(mi);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int mi = 0; mi < size(val); ++mi) {
+        float result = 0.f;
+        #pragma unroll
+        for (int w = 0; w < kNWarpsN; ++w) {
+            result += smem_reduce[row_indices[mi] * stride + w];
+        }
+        val(mi) = result;
+    }
+    __syncthreads();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template<typename Tensor0, typename Tensor1>
 __forceinline__ __device__ void rescale_o(Tensor0 &acc_o, Tensor1 &scale_o) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -182,6 +231,64 @@ struct Softmax {
         quad_allreduce_(row_sum, row_sum, sum_op);
         TensorT lse = make_fragment_like(row_sum);
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float sum = row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+            lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
+            float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
+        }
+        return lse;
+    };
+
+    // Cross-warp softmax: reduces across kNWarpsN warps via shared memory
+    template<bool Is_first, bool Check_inf=false, int kNWarpsN, typename Tensor0>
+    __forceinline__ __device__ TensorT softmax_cross_warp(Tensor0 &acc_s, float softmax_scale_log2,
+                                                          float *smem_reduce, int n_warp_idx,
+                                                          const int *row_indices, int stride) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        TensorT scale_o;
+        clear(scale_o);
+        if (Is_first) {
+            flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+            flash::cross_warp_reduce_max<kNWarpsN>(row_max, smem_reduce, n_warp_idx, row_indices, stride);
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
+        } else {
+            TensorT scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev);
+            flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+            flash::cross_warp_reduce_max<kNWarpsN>(row_max, smem_reduce, n_warp_idx, row_indices, stride);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                scale_o(mi) = scores_scale;
+                row_sum(mi) *= scores_scale;
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            flash::reduce_sum</*zero_init=*/false>(scores, row_sum);
+        }
+        return scale_o;
+    };
+
+    // Cross-warp normalize: reduces sum across kNWarpsN warps via shared memory
+    template<bool Is_dropout=false, bool Split=false, int kNWarpsN, typename Tensor0>
+    __forceinline__ __device__ TensorT normalize_softmax_lse_cross_warp(
+            Tensor0 &acc_o, float softmax_scale,
+            float *smem_reduce, int n_warp_idx,
+            const int *row_indices, int stride, float rp_dropout=1.0) {
+        SumOp<float> sum_op;
+        quad_allreduce_(row_sum, row_sum, sum_op);
+        flash::cross_warp_reduce_sum<kNWarpsN>(row_sum, smem_reduce, n_warp_idx, row_indices, stride);
+        TensorT lse = make_fragment_like(row_sum);
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
         #pragma unroll

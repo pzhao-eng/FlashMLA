@@ -36,8 +36,9 @@ struct Flash_fwd_kernel_traits_mla {
 
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
-    // static constexpr int kNWarpsS = 4;
-    // static constexpr int kNThreadsS = kNWarpsS * 32;
+    static constexpr int kNWarpsM = 2;
+    static constexpr int kNWarpsN = kNWarps / kNWarpsM;
+    static_assert(kNWarps == kNWarpsM * kNWarpsN);
 
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
@@ -49,13 +50,13 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
     static constexpr int kNumInnerStagesK = 3;
-    static constexpr int kNumInnerStagesV = 4;
+    static_assert(kHeadDim % kNumInnerStagesK == 0, "kHeadDim must be divisible by kNumInnerStagesK");
 
     using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-        Tile<Int<16 * kNWarps>, _16, _16>>;
+        Layout<Shape<Int<kNWarpsM>, Int<kNWarpsN>, _1>>,
+        Tile<Int<16 * kNWarpsM>, Int<8 * kNWarpsN>, _16>>;
 
     // static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
     // using TiledMmaO = decltype(make_tiled_mma(
@@ -85,10 +86,19 @@ struct Flash_fwd_kernel_traits_mla {
     using SmemLayoutV = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDimV>, kP>{}));
-    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>, kP>{}, Stride<Int<kBlockN>,_1, Int<kHeadDim * kBlockN>>{})));
+    // Use SmemLayoutK (not SmemLayoutV) so the pipeline stride matches the actual K buffer layout.
+    // SmemLayoutV has pipeline stride cosize(32,512)=16384, but K data for pipe=1 starts at cosize(32,576)=18432.
+    using SmemLayoutVtransposed = decltype(composition(SmemLayoutK{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>, kP>{}, Stride<Int<kBlockN>,_1, Int<kHeadDim * kBlockN>>{})));
 
-    using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreads>, _1, Int<kBlockN / 8>>>;
-    using SmemLayoutRow = Layout<Shape<_2, Int<kNThreads>>, Stride<_1, _2>>;
+    static constexpr int kBlockKSmemP = kBlockN % 64 == 0 ? 64 : 32;
+    static constexpr int kSwizzleP = kBlockKSmemP == 32 ? 2 : 3;
+    using SmemLayoutAtomP = decltype(
+        composition(Swizzle<kSwizzleP, 3, 3>{},
+                    Layout<Shape<_8, Int<kBlockKSmemP>>,
+                           Stride<Int<kBlockKSmemP>, _1>>{}));
+    using SmemLayoutP = decltype(tile_to_shape(
+        SmemLayoutAtomP{},
+        Shape<Int<kBlockM>, Int<kBlockN>>{}));
 
     using SmemLayoutAtomO = decltype(composition(
             Swizzle<kSwizzle, 3, 3>{},
@@ -99,6 +109,10 @@ struct Flash_fwd_kernel_traits_mla {
     
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+    // Smaller copy atoms for B operand: each warp covers N=8 (one MMA atom),
+    // so B fragment has only 4 vals/thread instead of 8.
+    using SmemCopyAtomB = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
+    using SmemCopyAtomBTransposed = Copy_Atom<SM75_U16x4_LDSM_T, elem_type>;
     using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
     using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
 
@@ -146,24 +160,26 @@ struct SharedStorageMLA {
         struct {
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutQ>> smem_q;
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutK>> smem_k;  // Double buffer
-            // cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutP>> smem_p;
-            // cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_scale;
         };
         struct {
-            // cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_max;
-            // cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_sum;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutO>> smem_o;
         };
     };
+    // P intermediate buffer for PV GEMM (kBlockM x kBlockN bf16)
+    cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutP>> smem_p;
+    // Cross-warp reduction buffer: kBlockM rows x (kNWarpsN+1) stride (padding avoids bank conflicts)
+    cute::array_aligned<typename Kernel_traits::ElementAccum, Kernel_traits::kBlockM * (Kernel_traits::kNWarpsN + 1)> smem_reduce;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Split, typename SharedStorage, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
-                                      SharedStorage &shared_storage, AccO tOrO, Softmax softmax) {
+                                      SharedStorage &shared_storage, AccO tOrO, Softmax softmax,
+                                      float *smem_reduce, int n_warp_idx, const int *row_indices, int reduce_stride) {
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
+    constexpr int kNWarpsN = Kernel_traits::kNWarpsN;
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -177,7 +193,8 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
 
     const int split_offset = __ldg(params.num_splits_ptr + bidb);
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(tOrO, params.scale_softmax);
+    Tensor lse = softmax.template normalize_softmax_lse_cross_warp</*Is_dropout=*/false, Split, kNWarpsN>(
+        tOrO, params.scale_softmax, smem_reduce, n_warp_idx, row_indices, reduce_stride);
 
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(shared_storage.smem_o.data())), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -261,7 +278,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    // constexpr int kNWarps = Kernel_traits::kNWarps;
+    constexpr int kNWarpsN = Kernel_traits::kNWarpsN;
+    constexpr int kNWarpsM = Kernel_traits::kNWarpsM;
+    constexpr int kReduceStride = kNWarpsN + 1;  // padding to avoid bank conflicts
+
+    // Cross-warp reduction setup
+    const int warp_idx = tidx / 32;
+    const int n_warp_idx = warp_idx / kNWarpsM;  // CuTe default column-major: stride=(1,kNWarpsM)
+    float *smem_reduce = reinterpret_cast<float *>(shared_storage.smem_reduce.data());
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -311,13 +335,36 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ_split);
 
-    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomB{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_K.partition_S(sK_split);
 
-    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomBTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    // P smem infrastructure for PV GEMM (route P through smem to avoid convert_layout_acc_Aregs issue)
+    Tensor sP = make_tensor(make_smem_ptr(shared_storage.smem_p.data()), typename Kernel_traits::SmemLayoutP{});
+    // C-fragment -> smem (store P after softmax)
+    auto smem_tiled_copy_PwriteC = make_tiled_copy_C(Copy_Atom<DefaultCopy, Element>{}, tiled_mma);
+    auto smem_thr_copy_PwriteC = smem_tiled_copy_PwriteC.get_thread_slice(tidx);
+    // smem -> A-fragment (load P as GEMM A-operand)
+    auto smem_tiled_copy_PreadA = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_PreadA = smem_tiled_copy_PreadA.get_thread_slice(tidx);
+    Tensor tSrP = thr_mma.partition_fragment_A(sP);           // A-fragment for P
+    Tensor tPsP_read = smem_thr_copy_PreadA.partition_S(sP);  // smem source for A-load
+
+    // Extract row indices for cross-warp softmax reduction
+    Tensor cS_id = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tScS_id = thr_mma.partition_C(cS_id);
+    auto scores_id_rowcol = make_tensor(tScS_id.data(), flash::convert_layout_acc_rowcol(tScS_id.layout()));
+    constexpr int kSoftmaxRows = decltype(size<0>(scores_id_rowcol))::value;
+    int row_indices[kSoftmaxRows];
+    #pragma unroll
+    for (int mi = 0; mi < kSoftmaxRows; ++mi) {
+        row_indices[mi] = int(get<0>(scores_id_rowcol(mi, 0)));
+    }
+
     // PREDICATES
     //
     // Construct identity layout for sQ and sK
@@ -385,14 +432,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         flash::cp_async_wait<1>();
         __syncthreads();
 
-        #pragma unroll 1
+        #pragma unroll
         for (int slice = 0; slice < kNumInnerStagesK; ++slice) {
             Tensor tSsQ_p = tSsQ(_,_,_,slice);
             Tensor tSsK_p = tSsK(_,_,_,slice, smem_pipe_read);
             flash::gemm_8x<false, false>(acc_s, tSrQ, tSrK, tSsQ_p, tSsK_p, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
                 smem_thr_copy_Q, smem_thr_copy_K);
         }
-        // if (cute::thread0()) { print(acc_s); print("\n");}
 
         const bool is_masking_step = masking_step >= 0;
         const bool is_first_masking_step = masking_step == 0;
@@ -416,19 +462,23 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
         // We have key_padding_mask so we'll need to Check_inf
         Tensor scale_o = is_first_masking_step
-                            ? softmax.template softmax</*Is_first=*/true,  /*Check_inf=*/Is_causal>(acc_s, params.scale_softmax_log2)
+                            ? softmax.template softmax_cross_warp</*Is_first=*/true,  /*Check_inf=*/Is_causal, kNWarpsN>(acc_s, params.scale_softmax_log2, smem_reduce, n_warp_idx, row_indices, kReduceStride)
                             : is_masking_step ?
-                            softmax.template softmax</*Is_first=*/false, /*Check_inf=*/Is_causal>(acc_s, params.scale_softmax_log2)
-                                            : softmax.template softmax</*Is_first=*/false, /*Check_inf=*//*Is_local=*/false>(acc_s, params.scale_softmax_log2);
-        // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
+                            softmax.template softmax_cross_warp</*Is_first=*/false, /*Check_inf=*/Is_causal, kNWarpsN>(acc_s, params.scale_softmax_log2, smem_reduce, n_warp_idx, row_indices, kReduceStride)
+                                            : softmax.template softmax_cross_warp</*Is_first=*/false, /*Check_inf=*/false, kNWarpsN>(acc_s, params.scale_softmax_log2, smem_reduce, n_warp_idx, row_indices, kReduceStride);
 
-        // Convert acc_s from fp32 to fp16/bf16
+        // Convert acc_s from fp32 to fp16/bf16, store P to smem, then PV GEMM via smem
         Tensor rP = flash::convert_type<Element>(acc_s);
         flash::rescale_o(acc_o, scale_o);
-        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+        // Store P to shared memory (C-fragment layout -> smem)
+        Tensor tPrP_src = smem_thr_copy_PwriteC.retile_S(rP);
+        Tensor tPsP_dst = smem_thr_copy_PwriteC.partition_D(sP);
+        cute::copy(smem_tiled_copy_PwriteC, tPrP_src, tPsP_dst);
+        __syncthreads();
+        // PV GEMM: both A (P) and B (Vt) from shared memory
         Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-        // if (thread0()) {print(rank<0>(rP.layout())); print("\n");}
+        flash::gemm_8x<false, false>(acc_o, tSrP, tOrVt, tPsP_read, tOsVt_p, tiled_mma, smem_tiled_copy_PreadA, smem_tiled_copy_V,
+            smem_thr_copy_PreadA, smem_thr_copy_V);
 
         // Advance the smem pipe
         smem_pipe_write = smem_pipe_read;
@@ -460,7 +510,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         flash::cp_async_wait<1>();
         __syncthreads();
 
-        #pragma unroll 1
+        #pragma unroll
         for (int slice = 0; slice < kNumInnerStagesK; ++slice) {
             Tensor tSsQ_p = tSsQ(_,_,_,slice);
             Tensor tSsK_p = tSsK(_,_,_,slice, smem_pipe_read);
@@ -468,13 +518,21 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 smem_thr_copy_Q, smem_thr_copy_K);
         }
 
-        Tensor scale_o = softmax.template softmax</*Is_first=*/false, /*Check_inf=*/false>(acc_s, params.scale_softmax_log2);
+        Tensor scale_o = softmax.template softmax_cross_warp</*Is_first=*/false, /*Check_inf=*/false, kNWarpsN>(acc_s, params.scale_softmax_log2, smem_reduce, n_warp_idx, row_indices, kReduceStride);
         Tensor rP = flash::convert_type<Element>(acc_s);
 
         flash::rescale_o(acc_o, scale_o);
-        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+        // Store P to shared memory (C-fragment layout -> smem)
+        {
+            Tensor tPrP_src = smem_thr_copy_PwriteC.retile_S(rP);
+            Tensor tPsP_dst = smem_thr_copy_PwriteC.partition_D(sP);
+            cute::copy(smem_tiled_copy_PwriteC, tPrP_src, tPsP_dst);
+        }
+        __syncthreads();
+        // PV GEMM: both A (P) and B (Vt) from shared memory
         Tensor tOsVt_p = tOsVt(_,_,_,smem_pipe_read);
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt_p, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_8x<false, false>(acc_o, tSrP, tOrVt, tPsP_read, tOsVt_p, tiled_mma, smem_tiled_copy_PreadA, smem_tiled_copy_V,
+            smem_thr_copy_PreadA, smem_thr_copy_V);
         smem_pipe_write = smem_pipe_read;
         ++smem_pipe_read;
         smem_pipe_read = smem_pipe_read % K_PIPE_MAX;
@@ -482,9 +540,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     // Epilogue
     if(!Split) {
-        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax);
+        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax,
+                                    smem_reduce, n_warp_idx, row_indices, kReduceStride);
     } else {
-        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax);
+        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, acc_o, softmax,
+                                   smem_reduce, n_warp_idx, row_indices, kReduceStride);
     }
 }
 
@@ -646,7 +706,7 @@ struct mha_fwd_splitkv_mla<T, Headdim, false> {
         static_assert(Headdim == 576);
         FLASH_ASSERT(params.d_v == 512);
         FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 32, 32, 4, T, 512>;
+        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 32, 32, 8, T, 512>;
         run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
     }
 };

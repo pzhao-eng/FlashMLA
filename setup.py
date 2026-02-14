@@ -36,8 +36,8 @@ def _write_ninja_file(path,
                       ldflags,
                       library_target,
                       with_cuda,
-                      **kwargs, # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension.
-                      ) -> None:
+                      **kwargs  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension.
+) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
     `path`: Where to write this file
@@ -209,6 +209,7 @@ def _write_ninja_file(path,
 torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
 
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
+DEBUG_BUILD = os.getenv("FLASH_MLA_DEBUG", "FALSE") == "TRUE"
 
 
 def append_nvcc_threads(nvcc_extra_args):
@@ -245,10 +246,16 @@ cc_flag.append("arch=compute_90a,code=sm_90a")
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-if IS_WINDOWS:
-    cxx_args = ["/O2", "/std:c++17", "/DNDEBUG", "/W0"]
+if DEBUG_BUILD:
+    if IS_WINDOWS:
+        cxx_args = ["/Od", "/Zi", "/std:c++17", "/W0"]
+    else:
+        cxx_args = ["-O0", "-g", "-std=c++17", "-Wno-deprecated-declarations"]
 else:
-    cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
+    if IS_WINDOWS:
+        cxx_args = ["/O2", "/std:c++17", "/DNDEBUG", "/W0"]
+    else:
+        cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
 ext_modules.append(
@@ -259,9 +266,8 @@ ext_modules.append(
             "cxx": cxx_args + get_features_args(),
             "nvcc": append_nvcc_threads(
                 [
-                    "-O3",
+                    "-O0" if DEBUG_BUILD else "-O3",
                     "-std=c++17",
-                    "-DNDEBUG",
                     "-D_USE_MATH_DEFINES",
                     "-Wno-deprecated-declarations",
                     "-U__CUDA_NO_HALF_OPERATORS__",
@@ -270,9 +276,10 @@ ext_modules.append(
                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
-                    "--use_fast_math",
-                    "--ptxas-options=-v,--register-usage-level=10"
                 ]
+                + ([] if DEBUG_BUILD else ["-DNDEBUG", "--use_fast_math"])
+                + (["-g", "-G", "-lineinfo"] if DEBUG_BUILD else [])
+                + ["--ptxas-options=-v,--register-usage-level=10"]
                 + cc_flag
             ) + get_features_args(),
         },
