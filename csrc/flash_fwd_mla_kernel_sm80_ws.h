@@ -153,6 +153,25 @@ struct SoftmaxWS : public flash::Softmax<kNRows> {
         }
         return lse;
     };
+
+    // Finalize: row_sum is already fully reduced — just normalize acc_o and compute LSE.
+    // Called in the epilogue where all threads participate (no cross-warp reduction needed).
+    template<bool Split=false, typename Tensor0>
+    __forceinline__ __device__ TensorT finalize_softmax_lse(Tensor0 &acc_o, float softmax_scale) {
+        using namespace cute;
+        TensorT lse = make_fragment_like(this->row_sum);
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float sum = this->row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+            lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : this->row_max(mi) * softmax_scale + __logf(sum);
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= inv_sum; }
+        }
+        return lse;
+    };
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -173,11 +192,13 @@ constexpr auto getSmemLayoutK_ws() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Kernel traits for warp-specialized SM80 MLA kernel
-// Consumer (4 warps, tidx 0-127): QK^T GEMM + softmax
-// Producer (4 warps, tidx 128-255): global memory loads
+// Consumer (kNWarpsS warps): QK^T GEMM + softmax
+// Producer (kNWarps - kNWarpsS warps): global memory loads
 // Both: PV GEMM via TiledMmaO
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+         int kNWarpsS_ = 4,
+         typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla_ws {
     using Element = elem_type;
     using ElementAccum = float;
@@ -185,12 +206,14 @@ struct Flash_fwd_kernel_traits_mla_ws {
 
     static constexpr int kNWarps = kNWarps_;         // 8 total
     static constexpr int kNThreads = kNWarps * 32;   // 256
-    static constexpr int kNWarpsS = 4;               // consumer warps
-    static constexpr int kNThreadsS = kNWarpsS * 32; // 128 consumer threads
+    static constexpr int kNWarpsS = kNWarpsS_;       // consumer warps
+    static constexpr int kNThreadsS = kNWarpsS * 32; // consumer threads
+    static_assert(kNWarpsS_ > 0 && kNWarpsS_ < kNWarps_ && kNWarpsS_ % 2 == 0,
+                  "kNWarpsS must be even, positive, and less than kNWarps");
 
-    // Consumer QK^T MMA: 2D tiling with 4 warps
+    // Consumer QK^T MMA: 2D tiling with kNWarpsS warps
     static constexpr int kNWarpsM = 2;               // M-dimension warps in consumer
-    static constexpr int kNWarpsN = kNWarpsS / kNWarpsM; // 2 N-dimension warps in consumer
+    static constexpr int kNWarpsN = kNWarpsS / kNWarpsM; // N-dimension warps in consumer
     static_assert(kNWarpsS == kNWarpsM * kNWarpsN);
 
     // PV GEMM (all 8 warps): 2M x 4N
@@ -208,8 +231,7 @@ struct Flash_fwd_kernel_traits_mla_ws {
     static constexpr int kNumInnerStagesK = 3;
     static_assert(kHeadDim % kNumInnerStagesK == 0, "kHeadDim must be divisible by kNumInnerStagesK");
 
-    // Consumer TiledMma for QK^T: 4 warps in 2M x 2N layout
-    // Covers 32x16 per call; for kBlockN=32, CuTe produces MMA_N=2 tiles
+    // Consumer TiledMma for QK^T: kNWarpsS warps in kNWarpsM x kNWarpsN layout
     using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
     using TiledMmaS = TiledMMA<
         MMA_Atom_Arch,
@@ -273,16 +295,25 @@ struct Flash_fwd_kernel_traits_mla_ws {
     using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
     using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
 
-    // GmemTiledCopy for PRODUCER loads (128 threads)
+    // GmemTiledCopy for PRODUCER loads
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
     using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
-    static constexpr int kNThreadsLoad = kNThreads - kNThreadsS; // 128
+    static constexpr int kNThreadsLoad = kNThreads - kNThreadsS;
     static_assert(kNThreadsLoad % kGmemThreadsPerRow == 0, "kNThreadsLoad must be a multiple of kGmemThreadsPerRow");
+    // Rows per tile must divide kBlockM and kBlockN. Find largest valid value.
+    static constexpr int kGmemRowsRaw = kNThreadsLoad / kGmemThreadsPerRow;
+    static constexpr int kGmemRowsEff = []() constexpr {
+        for (int r = kGmemRowsRaw; r >= 1; --r) {
+            if (kBlockM % r == 0 && kBlockN % r == 0) return r;
+        }
+        return 1;
+    }();
+    static constexpr int kNThreadsLoadEff = kGmemRowsEff * kGmemThreadsPerRow;
 
     using GmemLayoutAtom = Layout<
-            Shape<Int<kNThreadsLoad / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+            Shape<Int<kGmemRowsEff>, Int<kGmemThreadsPerRow>>,
             Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopy = decltype(make_tiled_copy(
             Copy_Atom<Gmem_copy_struct, Element>{},
@@ -332,8 +363,9 @@ struct SharedStorageMLA_WS {
     cute::array_aligned<typename Kernel_traits::ElementAccum, Kernel_traits::kBlockM> smem_scale;
     cute::array_aligned<typename Kernel_traits::ElementAccum, Kernel_traits::kBlockM> smem_max;
     cute::array_aligned<typename Kernel_traits::ElementAccum, Kernel_traits::kBlockM> smem_sum;
-    // Cross-warp reduction buffer: max of (consumer kNWarpsN+1, epilogue kNWarpsN_O+1)
-    static constexpr int kReduceStride = Kernel_traits::kNWarpsN_O + 1;  // 5 (for epilogue normalize)
+    // Cross-warp reduction buffer: max of (consumer kNWarpsN, epilogue kNWarpsN_O) + 1
+    static constexpr int kReduceStride = (Kernel_traits::kNWarpsN > Kernel_traits::kNWarpsN_O
+        ? Kernel_traits::kNWarpsN : Kernel_traits::kNWarpsN_O) + 1;
     cute::array_aligned<typename Kernel_traits::ElementAccum, Kernel_traits::kBlockM * kReduceStride> smem_reduce;
 };
 
@@ -357,9 +389,9 @@ __forceinline__ __device__ void store_ws(const Flash_fwd_mla_params &params, con
 
     const int split_offset = __ldg(params.num_splits_ptr + bidb);
 
-    // Epilogue: all 256 threads participate. Use base class normalize with __syncthreads().
-    Tensor lse = softmax.template normalize_softmax_lse_cross_warp</*Is_dropout=*/false, Split, kNWarpsN_O>(
-        tOrO, params.scale_softmax, smem_reduce, n_warp_idx, row_indices, reduce_stride);
+    // Epilogue: all 256 threads participate. row_sum is already fully reduced —
+    // just normalize acc_o and compute LSE (no cross-warp reduction needed).
+    Tensor lse = softmax.template finalize_softmax_lse<Split>(tOrO, params.scale_softmax);
 
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(shared_storage.smem_o.data())), typename Kernel_traits::SmemLayoutO{});
@@ -669,7 +701,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
             }
         }
 
-        // Write final softmax stats for producer
+        // Compute full row_sum across consumer N-warps before writing to smem
+        {
+            flash::SumOp<float> sum_op;
+            flash::quad_allreduce_(softmax.row_sum, softmax.row_sum, sum_op);
+            flash::cross_warp_reduce_sum_ws<kNWarpsN>(softmax.row_sum, smem_reduce, n_warp_idx, row_indices_s, kReduceStride, kBarrierSoftmaxReduce, kNThreadsS);
+        }
+
+        // Write final softmax stats for producer (row_sum is now the full sum)
         #pragma unroll
         for (int mi = 0; mi < kSoftmaxRows; ++mi) {
             smem_max_ptr[row_indices_s[mi]] = softmax.row_max(mi);
@@ -677,8 +716,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
         }
         flash::sm80_barrier::named_barrier_arrive(kBarrierSoftmaxReady, kNThreads);
 
-    // ===== PRODUCER PATH (tidx 128-255) =====
+    // ===== PRODUCER PATH =====
     } else {
+        constexpr int kNThreadsLoadEff = Kernel_traits::kNThreadsLoadEff;
+        const bool is_loader = (tidx - kNThreadsS) < kNThreadsLoadEff;
+        // Clamp thread index for non-loader threads (they won't issue copies)
+        const int load_tidx = is_loader ? (tidx - kNThreadsS) : 0;
+
         const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
         int cur_block_table = __ldg(&block_table[n_block]);
 
@@ -692,7 +736,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
                                 make_stride(params.k_row_stride, _1{}));
 
         typename Kernel_traits::GmemTiledCopy gmem_tiled_copy;
-        auto gmem_thr_copy = gmem_tiled_copy.get_thread_slice(tidx - kNThreadsS);
+        auto gmem_thr_copy = gmem_tiled_copy.get_thread_slice(load_tidx);
 
         Tensor tQgQ = gmem_thr_copy.partition_S(gQ);
         Tensor tQsQ = gmem_thr_copy.partition_D(sQ);
@@ -708,8 +752,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
         Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
         // Prologue: Load Q
-        flash::copy</*Is_even_MN*/false, /*Is_even_K*/true>(gmem_tiled_copy, tQgQ, tQsQ, tQcQ, tQpQ,
-                                            params.seqlen_q - m_block * kBlockM);
+        if (is_loader) {
+            flash::copy</*Is_even_MN*/false, /*Is_even_K*/true>(gmem_tiled_copy, tQgQ, tQsQ, tQcQ, tQpQ,
+                                                params.seqlen_q - m_block * kBlockM);
+        }
 
         // Prologue: Load first K block
         int smem_pipe_read = 0;
@@ -717,8 +763,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
         const index_t offset_k = cur_block_table * params.k_batch_stride;
         tKgK.data() = tKgK.data() + offset_k;
         Tensor tKsK_p = tKsK(_, _, _, 0);
-        flash::copy</*Is_even_MN*/false, /*Is_even_K*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy, tKgK, tKsK_p, tKVcKV, tKVpKV,
-                                           seqlen_k - n_block * kBlockN);
+        if (is_loader) {
+            flash::copy</*Is_even_MN*/false, /*Is_even_K*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy, tKgK, tKsK_p, tKVcKV, tKVpKV,
+                                               seqlen_k - n_block * kBlockN);
+        }
         tKgK.data() = tKgK.data() + -offset_k;
         cute::cp_async_fence();
         flash::cp_async_wait<0>();
@@ -734,7 +782,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla_ws(const Flas
                 const index_t offset_k_next = cur_block_table * params.k_batch_stride;
                 tKgK.data() = tKgK.data() + offset_k_next;
                 Tensor tKsK_next = tKsK(_, _, _, smem_pipe_write);
-                flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK_next, tKVcKV, tKVpKV);
+                if (is_loader) {
+                    flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy, tKgK, tKsK_next, tKVcKV, tKVpKV);
+                }
                 tKgK.data() = tKgK.data() + -offset_k_next;
                 cute::cp_async_fence();
             }

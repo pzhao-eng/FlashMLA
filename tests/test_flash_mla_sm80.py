@@ -67,6 +67,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
         return flash_mla_with_kvcache(
             q, blocked_k, block_table, cache_seqlens, dv,
             tile_scheduler_metadata, num_splits, causal=causal,
+            warp_spec=False,
         )
 
     def ref_mla():

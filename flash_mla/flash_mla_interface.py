@@ -33,7 +33,7 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    warp_spec: bool = False,
+    warp_spec: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:

@@ -32,7 +32,10 @@ template<>
 void mha_fwd_splitkv_mla_ws<cutlass::bfloat16_t, 576>::run(Flash_fwd_mla_params &params, cudaStream_t stream) {
     FLASH_ASSERT(params.d_v == 512);
     FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-    using Kernel_traits = Flash_fwd_kernel_traits_mla_ws<576, 32, 32, 8, cutlass::bfloat16_t, 512>;
+    // kNWarpsS: consumer/producer warp split. Valid values with kBlockN=32: 2 or 4.
+    // kNWarpsS=4 → 4 consumer + 4 producer (default)
+    // kNWarpsS=2 → 2 consumer + 6 producer
+    using Kernel_traits = Flash_fwd_kernel_traits_mla_ws<576, 32, 32, 8, 4, cutlass::bfloat16_t, 512>;
     run_flash_splitkv_fwd_mla_ws<Kernel_traits, flash::SharedStorageMLA_WS<Kernel_traits>>(params, stream);
 }
 
