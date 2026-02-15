@@ -52,6 +52,11 @@ struct mha_fwd_splitkv_mla {
     static void run(Flash_fwd_mla_params &params, cudaStream_t stream);
 };
 
+template<typename T, int Headdim>
+struct mha_fwd_splitkv_mla_ws {
+    static void run(Flash_fwd_mla_params &params, cudaStream_t stream);
+};
+
 struct Mla_metadata_params {
     int *__restrict__ seqlens_k_ptr;
     int *__restrict__ tile_scheduler_metadata_ptr;

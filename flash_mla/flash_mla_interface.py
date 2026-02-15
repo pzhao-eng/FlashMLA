@@ -33,6 +33,7 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    warp_spec: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -45,6 +46,7 @@ def flash_mla_with_kvcache(
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
+        warp_spec: bool. Use warp-specialized SM80 kernel (only affects SM80).
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -63,5 +65,6 @@ def flash_mla_with_kvcache(
         causal,
         tile_scheduler_metadata,
         num_splits,
+        warp_spec,
     )
     return out, softmax_lse

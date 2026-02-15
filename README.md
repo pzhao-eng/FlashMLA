@@ -7,6 +7,7 @@ FlashMLA was initially developed based on Hopper(can refer to:https://github.com
 Currently released:
 - BF16
 - Paged kvcache with block size of 32
+- Warp-specialized SM80 kernel (`warp_spec=True`): splits 8 warps into 4 consumer (QK^T GEMM + softmax) and 4 producer (global memory loads), with all 8 warps cooperating on PV GEMM. Uses double-buffered K/V loads and raw PTX barriers for SM80 compatibility.
 
 ## Quick start
 
@@ -38,9 +39,15 @@ tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, s_q * h_q 
 
 for i in range(num_layers):
     ...
+    # Cooperative kernel (default)
     o_i, lse_i = flash_mla_with_kvcache(
         q_i, kvcache_i, block_table, cache_seqlens, dv,
         tile_scheduler_metadata, num_splits, causal=True,
+    )
+    # Warp-specialized kernel (SM80 only)
+    o_i, lse_i = flash_mla_with_kvcache(
+        q_i, kvcache_i, block_table, cache_seqlens, dv,
+        tile_scheduler_metadata, num_splits, causal=True, warp_spec=True,
     )
     ...
 ```

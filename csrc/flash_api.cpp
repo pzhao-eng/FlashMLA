@@ -71,7 +71,8 @@ mha_fwd_kvcache_mla(
     const float softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits                 // batch_size + 1
+    const at::Tensor &num_splits,                // batch_size + 1
+    bool warp_spec                               // Use warp-specialized SM80 kernel
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -194,6 +195,8 @@ mha_fwd_kvcache_mla(
     if (q_dtype == torch::kBFloat16) {
         if (is_sm90) {
             mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, true>::run(params, stream);
+        } else if (warp_spec) {
+            mha_fwd_splitkv_mla_ws<cutlass::bfloat16_t, 576>::run(params, stream);
         } else {
             mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, false>::run(params, stream);
         }
